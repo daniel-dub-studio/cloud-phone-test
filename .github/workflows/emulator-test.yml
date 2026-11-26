@@ -30,9 +30,22 @@ jobs:
             adb shell input keyevent 82
             sleep 5
             adb exec-out screencap -p > /tmp/screen.png
-            ls -la /tmp/screen.png
-      - name: Upload screenshot
+            echo "--- downloading Muse APK ---"
+            curl -L -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36" -o /tmp/muse.apk "https://apkpure.net/muse-from-meta/com.facebook.aura/download"
+            ls -la /tmp/muse.apk
+            file /tmp/muse.apk || true
+            echo "--- installing ---"
+            adb install -r -g /tmp/muse.apk || echo INSTALL_FAILED
+            adb shell pm list packages | grep aura || echo NOT_INSTALLED
+            echo "--- launching ---"
+            adb shell monkey -p com.facebook.aura -c android.intent.category.LAUNCHER 1 || echo LAUNCH_FAILED
+            sleep 10
+            adb exec-out screencap -p > /tmp/muse-open.png
+            ls -la /tmp/screen.png /tmp/muse-open.png
+      - name: Upload screenshots
         uses: actions/upload-artifact@v4
         with:
           name: emulator-screen
-          path: /tmp/screen.png
+          path: |
+            /tmp/screen.png
+            /tmp/muse-open.png
