@@ -1,0 +1,32 @@
+name: muse-signup-desktop
+on:
+  workflow_dispatch:
+jobs:
+  signup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Playwright and Chromium
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install playwright
+          python3 -m playwright install chromium --with-deps
+      - name: Run Muse signup (desktop Chrome)
+        run: xvfb-run -a python3 scripts/muse-signup-playwright.py || true
+      - name: Upload screenshots and account
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: muse-signup-desktop
+          path: |
+            /tmp/muse-account.txt
+            /tmp/step1-temp.png
+            /tmp/step2-form.png
+            /tmp/step3-after-continue.png
+            /tmp/step4-verify.png
