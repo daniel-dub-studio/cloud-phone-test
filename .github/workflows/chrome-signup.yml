@@ -1,0 +1,211 @@
+name: chrome-signup
+on:
+  workflow_dispatch:
+jobs:
+  signup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check KVM
+        run: |
+          ls -l /dev/kvm || echo "NO KVM DEVICE"
+          grep -c -E 'vmx|svm' /proc/cpuinfo || true
+          curl -s ifconfig.me; echo
+      - name: Enable KVM group perms
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+      - name: Boot emulator and run Chrome signup
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          target: google_apis_playstore
+          arch: x86_64
+          profile: pixel_5
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+          script: |
+            adb shell getprop sys.boot_completed
+            adb shell input keyevent 82 || true
+            sleep 5
+            adb exec-out screencap -p > /tmp/screen.png || true
+            cat > /tmp/tap.py <<'PYEOF'
+            import sys, re, subprocess, xml.etree.ElementTree as ET
+            path, needle = sys.argv[1], sys.argv[2]
+            try:
+                tree = ET.parse(path)
+            except Exception as e:
+                print(f"TAP {needle}: cannot parse {path}: {e}")
+                sys.exit(0)
+            nodes = list(tree.iter('node'))
+            def matches(n):
+                hay = '|'.join([n.get('text') or '', n.get('content-desc') or '', n.get('resource-id') or ''])
+                return needle.lower() in hay.lower()
+            def tap(n):
+                b = n.get('bounds') or ''
+                m = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', b)
+                if not m:
+                    return False
+                x = (int(m.group(1)) + int(m.group(3))) // 2
+                y = (int(m.group(2)) + int(m.group(4))) // 2
+                print(f"TAP {needle}: text={n.get('text')!r} class={n.get('class')} bounds={b} -> ({x},{y})")
+                subprocess.run(['adb', 'shell', 'input', 'tap', str(x), str(y)], check=False)
+                return True
+            for n in nodes:
+                if matches(n) and 'EditText' in (n.get('class') or ''):
+                    if tap(n):
+                        sys.exit(0)
+            for n in nodes:
+                if matches(n) and (n.get('clickable') == 'true'):
+                    if tap(n):
+                        sys.exit(0)
+            for n in nodes:
+                if matches(n):
+                    if tap(n):
+                        sys.exit(0)
+            print(f"TAP {needle}: NOT FOUND in {path}")
+            PYEOF
+            dump_screen () {
+              adb shell uiautomator dump /sdcard/window_dump.xml || true
+              adb pull /sdcard/window_dump.xml "$1" || true
+              echo "--- dump $1 ---"
+              cat "$1" || echo "NO DUMP FILE $1"
+            }
+            echo "=== STEP 1: temp-mail.org ==="
+            adb shell am start -a android.intent.action.VIEW -d https://temp-mail.org || true
+            sleep 12
+            dump_screen /tmp/dump1.xml
+            python3 /tmp/tap.py /tmp/dump1.xml "Use without an account" || true
+            sleep 4
+            dump_screen /tmp/dump1b.xml
+            python3 /tmp/tap.py /tmp/dump1b.xml "No thanks" || true
+            sleep 8
+            dump_screen /tmp/dump1c.xml
+            adb exec-out screencap -p > /tmp/step1-tempmail.png || true
+            EMAIL=$(grep -oE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' /tmp/dump1c.xml | head -1 || true)
+            if [ -z "$EMAIL" ]; then EMAIL=$(grep -oE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' /tmp/dump1b.xml | head -1 || true); fi
+            if [ -z "$EMAIL" ]; then EMAIL=$(grep -oE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' /tmp/dump1.xml | head -1 || true); fi
+            echo "TEMP EMAIL: $EMAIL"
+            PW="El$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 10)42"
+            echo "EMAIL=$EMAIL" > /tmp/elevenlabs-account.txt
+            echo "PASSWORD=$PW" >> /tmp/elevenlabs-account.txt
+            echo "--- elevenlabs-account.txt ---"
+            cat /tmp/elevenlabs-account.txt
+            echo "=== STEP 2: ElevenLabs sign-up page ==="
+            adb shell am start -a android.intent.action.VIEW -d https://elevenlabs.io/app/sign-up || true
+            sleep 15
+            dump_screen /tmp/dump2.xml
+            adb exec-out screencap -p > /tmp/step2-signup.png || true
+            python3 /tmp/tap.py /tmp/dump2.xml "Accept all" || true
+            sleep 3
+            dump_screen /tmp/dump2b.xml
+            OUT=$(python3 /tmp/tap.py /tmp/dump2b.xml "Name" || true)
+            echo "$OUT"
+            if echo "$OUT" | grep -q "-> ("; then
+              sleep 1
+              adb shell input text "Test%sUser" || true
+              sleep 1
+            fi
+            dump_screen /tmp/dump2c.xml
+            ESCAPED_EMAIL=$(echo "$EMAIL" | sed 's/@/%40/g')
+            if [ -n "$EMAIL" ]; then
+              OUT=$(python3 /tmp/tap.py /tmp/dump2c.xml "Email" || true)
+              echo "$OUT"
+              if echo "$OUT" | grep -q "-> ("; then
+                sleep 2
+                adb shell input text "$ESCAPED_EMAIL" || true
+                sleep 1
+              else
+                echo "EMAIL FIELD NOT FOUND"
+              fi
+            else
+              echo "NO EMAIL - skipping email fill"
+            fi
+            dump_screen /tmp/dump2d.xml
+            OUT=$(python3 /tmp/tap.py /tmp/dump2d.xml "Password" || true)
+            echo "$OUT"
+            if echo "$OUT" | grep -q "-> ("; then
+              sleep 2
+              adb shell input text "$PW" || true
+              sleep 1
+            else
+              echo "PASSWORD FIELD NOT FOUND"
+            fi
+            adb shell input keyevent 4 || true
+            sleep 2
+            dump_screen /tmp/dump2e.xml
+            echo "=== STEP 3: submit ==="
+            SUBMITTED=""
+            for BTN in "Sign up" "Create account" "Continue"; do
+              OUT=$(python3 /tmp/tap.py /tmp/dump2e.xml "$BTN" || true)
+              echo "$OUT"
+              if echo "$OUT" | grep -q "-> ("; then SUBMITTED="$BTN"; break; fi
+            done
+            echo "SUBMIT BUTTON TAPPED: $SUBMITTED"
+            sleep 8
+            dump_screen /tmp/dump3.xml
+            adb exec-out screencap -p > /tmp/step3-submitted.png || true
+            echo "=== STEP 4: check result ==="
+            if grep -qiE "captcha|not a robot|hcaptcha|recaptcha|verify you are human|human verification" /tmp/dump3.xml; then
+              echo "BLOCKED: captcha/verification challenge screen detected - stopping, not solving it"
+              adb exec-out screencap -p > /tmp/step4-blocked.png || true
+              dump_screen /tmp/dump4.xml
+            elif grep -qiE "check your email|verify your email|confirm your email|verification email|sent you an email|check your inbox" /tmp/dump3.xml; then
+              echo "EMAIL VERIFICATION requested - going back to temp-mail"
+              adb shell am start -a android.intent.action.VIEW -d https://temp-mail.org || true
+              sleep 12
+              dump_screen /tmp/dump5.xml
+              adb exec-out screencap -p > /tmp/step5-inbox.png || true
+              if [ -n "$EMAIL" ]; then grep -F "$EMAIL" /tmp/dump5.xml && echo "SAME MAILBOX: $EMAIL" || echo "MAILBOX ADDRESS NOT SEEN IN DUMP5"; fi
+              if grep -qi "elevenlabs" /tmp/dump5.xml; then
+                echo "ElevenLabs email found in inbox"
+              else
+                echo "No ElevenLabs email yet - waiting 20s more"
+                sleep 20
+                dump_screen /tmp/dump5b.xml
+                adb exec-out screencap -p > /tmp/step5-inbox.png || true
+              fi
+              if [ -f /tmp/dump5b.xml ]; then
+                python3 /tmp/tap.py /tmp/dump5b.xml "ElevenLabs" || true
+              else
+                python3 /tmp/tap.py /tmp/dump5.xml "ElevenLabs" || true
+              fi
+              sleep 5
+              dump_screen /tmp/dump5c.xml
+              adb exec-out screencap -p > /tmp/step5-inbox.png || true
+            else
+              echo "UNKNOWN post-submit state - capturing dump and screenshot"
+              adb exec-out screencap -p > /tmp/step4-blocked.png || true
+              dump_screen /tmp/dump4.xml
+            fi
+            echo "=== ARTIFACT LIST ==="
+            ls -la /tmp/screen.png /tmp/step*.png /tmp/dump*.xml /tmp/elevenlabs-account.txt || true
+            echo "=== SCRIPT DONE ==="
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chrome-signup
+          path: |
+            /tmp/screen.png
+            /tmp/step1-tempmail.png
+            /tmp/step2-signup.png
+            /tmp/step3-submitted.png
+            /tmp/step4-blocked.png
+            /tmp/step5-inbox.png
+            /tmp/elevenlabs-account.txt
+            /tmp/dump1.xml
+            /tmp/dump1b.xml
+            /tmp/dump1c.xml
+            /tmp/dump2.xml
+            /tmp/dump2b.xml
+            /tmp/dump2c.xml
+            /tmp/dump2d.xml
+            /tmp/dump2e.xml
+            /tmp/dump3.xml
+            /tmp/dump4.xml
+            /tmp/dump5.xml
+            /tmp/dump5b.xml
+            /tmp/dump5c.xml
+          if-no-files-found: warn
