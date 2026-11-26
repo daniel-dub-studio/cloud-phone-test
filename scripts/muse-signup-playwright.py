@@ -20,8 +20,9 @@ Flow:
      gist holds a 6-digit code, enter it without clicking the hidden field
      (plain fill, then force fill, then JavaScript value-set with native
      input/change events), press Enter, and wait. If a name is asked for,
-     enter "Muse". If the code is not accepted, keep polling for a new
-     code until the deadline.
+     enter "Muse". If the code is rejected (the page stays on the code
+     step after Enter), stop and report 'code rejected/expired' -- do not
+     re-enter the same code from the gist.
   3. After the code is accepted, the page asks "What's your birthday?"
      with Month / Day / Year dropdowns and a Confirm button: set
      Month=April, Day=12, Year=2005 (select_option by visible label),
@@ -40,6 +41,11 @@ page to leave the birthday state instead of re-running the handler (run #6
 bailed out mid-transition when Confirm became a "Creating account..."
 loading button). Also stop if the account already exists or a password /
 sign-in is asked for instead of a code.
+
+Run #8 change: when a code is entered and rejected (the page stays on the
+code step after Enter), stop and report 'code rejected/expired' instead of
+looping and re-entering the same code from the gist (run #7 looped on the
+expired code, then failed to find the code field at all).
 
 Outputs (all under /tmp, uploaded as the muse-signup-desktop artifact):
   muse-account.txt, step2-form.png, step3-after-continue.png,
@@ -474,6 +480,21 @@ def run_signup():
                 page.keyboard.press("Enter")
                 state, waited = wait_next_step(page)
                 log("after code: state=%s (waited %ds)" % (state, waited))
+                if state == "code":
+                    # The page stayed on the code step: the code was
+                    # rejected (or expired). Re-check once after a short
+                    # pause in case the page was mid-transition; if it is
+                    # still on the code step, stop -- do not re-enter the
+                    # same code from the gist.
+                    page.wait_for_timeout(10000)
+                    state = classify(page)
+                    log("after code re-check: state=%s" % state)
+                    if state == "code":
+                        shot(page, "step4-verify.png")
+                        return "STOP: code rejected/expired"
+                    if state == "other":
+                        state, _ = wait_next_step(page)
+                        log("after code re-check wait: state=%s" % state)
                 shot(page, "step4-verify.png")
                 continue
             shot(page, "step4-verify.png")
