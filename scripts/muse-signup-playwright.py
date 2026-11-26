@@ -25,13 +25,21 @@ Flow:
   3. After the code is accepted, the page asks "What's your birthday?"
      with Month / Day / Year dropdowns and a Confirm button: set
      Month=April, Day=12, Year=2005 (select_option by visible label),
-     then click Confirm. Then if a name is asked, enter "Muse".
+     then click Confirm. Then WAIT up to 90 s for the page to leave the
+     birthday state -- a "Creating account..." button means the account
+     is still being created, so keep waiting; do NOT re-run the birthday
+     handler. Then if a name is asked, enter "Muse".
   4. STOP (screenshot step4-verify.png, log the reason, do not proceed) if
      a phone number, a payment card, a captcha/Turnstile, or a rejected
-     email is asked for.
+     email is asked for -- or if the page says the account already exists
+     or asks for a password / sign-in instead of a code (run #6's account
+     may already have been created server-side).
 
-Run #6 change: handle the birthday step run #5 reached (it stopped on an
-unrecognised screen, which was the birthday form).
+Run #7 change: after Confirm on the birthday step, wait up to 90 s for the
+page to leave the birthday state instead of re-running the handler (run #6
+bailed out mid-transition when Confirm became a "Creating account..."
+loading button). Also stop if the account already exists or a password /
+sign-in is asked for instead of a code.
 
 Outputs (all under /tmp, uploaded as the muse-signup-desktop artifact):
   muse-account.txt, step2-form.png, step3-after-continue.png,
@@ -62,6 +70,9 @@ CAPTCHA_WORDS = ("captcha", "turnstile", "verify you are human",
                  "not a robot")
 REJECTED_WORDS = ("disposable", "not accepted", "try a different email",
                   "invalid email", "cannot use this email")
+EXISTS_WORDS = ("already exists", "already registered",
+                "already have an account", "email already in use",
+                "account already exists")
 CODE_WORDS = ("verification code", "enter the code", "check your email",
               "check your inbox", "we sent", "sent you a code")
 SUCCESS_WORDS = ("welcome", "account created", "get started",
@@ -211,7 +222,8 @@ def handle_birthday(page):
 
 def classify(page):
     """Classify the current muse.ai screen. Returns one of: code, phone,
-    card, captcha, rejected, birthday, success, name, code-ok, other."""
+    card, captcha, rejected, exists, password, birthday, success, name,
+    code-ok, other."""
     low = body_text(page).lower()
     if any(w in low for w in PHONE_WORDS):
         return "phone"
@@ -221,6 +233,17 @@ def classify(page):
         return "captcha"
     if any(w in low for w in REJECTED_WORDS):
         return "rejected"
+    if any(w in low for w in EXISTS_WORDS):
+        return "exists"
+    pw = locate_in_frames(page, lambda f: f.locator("input[type='password']"))
+    if pw is not None:
+        try:
+            if pw.first.is_visible():
+                return "password"
+        except Exception:
+            pass
+    if "welcome back" in low or "enter your password" in low:
+        return "password"
     if "birthday" in low:
         return "birthday"
     loc = locate_in_frames(
@@ -241,8 +264,8 @@ def classify(page):
 
 
 def wait_next_step(page, timeout_s=60):
-    """Wait up to timeout_s for the form to give way to the next step, then
-    classify the new screen. Returns (state, waited_seconds)."""
+    """Wait for the page to reach a recognisable next step. Returns the
+    state, or 'other' on timeout."""
     waited = 0
     while waited < timeout_s:
         state = classify(page)
@@ -255,225 +278,221 @@ def wait_next_step(page, timeout_s=60):
     return state, waited
 
 
-def enter_code(page, code):
-    """Enter the code WITHOUT clicking the hidden field first. Tries, in
-    order: force fill, plain fill, JavaScript value-set with native
-    input/change events, typing into the visible OTP container. Verifies
-    via input_value after each attempt. Returns True when the value stuck.
-    The code digits are never logged."""
+def page_has_text(page, needle):
+    """True when any frame's body text contains needle (case-insensitive)."""
+    needle = needle.lower()
     for frame in page.frames:
         try:
-            inp = frame.locator(
-                "input[aria-label*='security code' i], "
-                "input[autocomplete='one-time-code']").first
-            if not inp.count():
-                continue
-            for method in ("fill", "force-fill", "js-set"):
-                try:
-                    if method == "fill":
-                        inp.fill(code, timeout=5000)
-                    elif method == "force-fill":
-                        inp.fill(code, force=True, timeout=5000)
-                    else:
-                        handle = inp.element_handle(timeout=5000)
-                        frame.evaluate(
-                            "(el, val) => {"
-                            " const setter = Object.getOwnPropertyDescriptor("
-                            " window.HTMLInputElement.prototype, 'value').set;"
-                            " setter.call(el, val);"
-                            " el.dispatchEvent(new Event('input', {bubbles: true}));"
-                            " el.dispatchEvent(new Event('change', {bubbles: true}));"
-                            " }", handle, code)
-                    val = inp.input_value() or ""
-                    if val == code:
-                        log("code field filled via %s" % method)
-                        return True
-                    log("code field filled via %s but the value did not stick" % method)
-                except Exception as exc:
-                    log("code fill %s EXC: %r" % (method, exc,))
-            try:
-                inp.click(timeout=5000, force=True)
-                inp.type(code, delay=100)
-                val = inp.input_value() or ""
-                if val == code:
-                    log("code typed into the OTP container")
-                    return True
-                log("code typed into the OTP container but the value did not stick")
-            except Exception as exc:
-                log("code type EXC: %r" % (exc,))
+            if needle in (frame.inner_text("body") or "").lower():
+                return True
         except Exception:
             continue
-    log("could not fill the code field by any method")
     return False
 
 
-def poll_gist_code(url, tried, deadline):
-    """Poll the gist raw URL every 30 s until its content is a 6-digit code
-    not already tried, or the deadline passes. Returns the code, or None.
-    The word 'waiting' means the code has not been put in yet. A cache
-    buster is added to each request so a cached 'waiting' is never served.
-    The code digits are never logged."""
-    check = 0
+def wait_leave_birthday(page, timeout_s=90):
+    """After Confirm on the birthday step, wait up to timeout_s for the
+    page to leave the birthday state. A 'Creating account...' indicator
+    means the account is still being created, so keep waiting. Transient
+    'other' states are waited through. Returns (state, waited_seconds):
+    a recognised non-birthday state, or 'birthday' if the page never left
+    it within the timeout."""
+    waited = 0
+    while waited < timeout_s:
+        state = classify(page)
+        if state not in ("birthday", "other"):
+            return state, waited
+        if page_has_text(page, "creating account"):
+            if waited % 15 == 0:
+                log("birthday: 'Creating account...' visible, still working (%ds)" % waited)
+        page.wait_for_timeout(5000)
+        waited += 5
+    state = classify(page)
+    log("wait_leave_birthday timed out after %ds, state=%s" % (timeout_s, state))
+    return state, waited
+
+
+def enter_code(page, code):
+    """Enter the 6-digit code into the hidden code field WITHOUT clicking
+    it first (a div intercepts clicks). Plain fill, then force fill, then
+    a JavaScript value-set with native input/change events. Returns True
+    when the field's value reads back as the code."""
+    loc = locate_in_frames(
+        page,
+        lambda f: f.locator("input[aria-label*='security code' i], "
+                            "input[autocomplete='one-time-code']"))
+    if loc is None:
+        log("code field not found")
+        return False
+    for frame in page.frames:
+        try:
+            loc.fill(code, timeout=10000)
+            if loc.input_value() == code:
+                return True
+        except Exception:
+            continue
+    try:
+        loc.fill(code, force=True, timeout=10000)
+        if loc.input_value() == code:
+            return True
+    except Exception:
+        pass
+    try:
+        loc.evaluate(
+            "(el, val) => { "
+            "const setter = Object.getOwnPropertyDescriptor("
+            "window.HTMLInputElement.prototype, 'value').set; "
+            "setter.call(el, val); "
+            "el.dispatchEvent(new Event('input', {bubbles: true})); "
+            "el.dispatchEvent(new Event('change', {bubbles: true})); }",
+            code)
+        if loc.input_value() == code:
+            return True
+    except Exception as exc:
+        log("code JS set EXC: %r" % (exc,))
+    return False
+
+
+def poll_gist_code(page, gist_url):
+    """Poll the gist raw URL every 30 s for up to 25 minutes. Returns the
+    6-digit code when the gist holds one, or None on timeout."""
+    deadline = time.time() + GIST_WAIT_SECONDS
+    n = 0
     while time.time() < deadline:
-        check += 1
-        cache_url = url + ("&" if "?" in url else "?") + "t=%d" % int(time.time())
+        n += 1
         try:
             req = urllib.request.Request(
-                cache_url, headers={"User-Agent": "muse-signup-desktop"})
-            with urllib.request.urlopen(req, timeout=20) as resp:
+                gist_url + "?t=%d" % int(time.time()))
+            with urllib.request.urlopen(req, timeout=30) as resp:
                 content = resp.read().decode("utf-8", "replace").strip()
-        except Exception as exc:
-            log("gist poll %d EXC: %r" % (check, exc))
+        except urllib.error.URLError as exc:
+            log("gist poll %d: fetch failed: %r" % (n, exc))
             content = ""
-        if content.lower() == "waiting":
-            log("gist poll %d: still 'waiting'" % check)
-        elif re.fullmatch(r"[0-9]{6}", content or ""):
-            if content in tried:
-                log("gist poll %d: code already tried, waiting for a new one" % check)
-            else:
-                log("gist poll %d: code received" % check)
-                return content
-        elif content:
-            log("gist poll %d: unexpected content %r, waiting" % (check, content[:40]))
-        else:
-            log("gist poll %d: no content, waiting" % check)
-        remaining = deadline - time.time()
-        if remaining <= 0:
-            break
-        time.sleep(min(GIST_POLL_SECONDS, remaining))
-    log("gist poll deadline reached (25 minutes) with no new code")
+        if re.fullmatch(r"\d{6}", content):
+            log("gist poll %d: code received" % n)
+            return content
+        if n == 1 or n % 20 == 0:
+            log("gist poll %d: still 'waiting' (content=%r)" % (n, content[:20]))
+        time.sleep(GIST_POLL_SECONDS)
+    log("gist poll: deadline reached after %d polls, no code" % n)
     return None
 
 
 def save_account(email, outcome):
     with open(TMP + "/muse-account.txt", "w") as f:
-        f.write("email: " + email + "\n")
-        f.write("outcome: " + outcome + "\n")
-    log("account file written")
+        f.write("email=%s\n" % email)
+        f.write("outcome=%s\n" % outcome)
+    log("saved muse-account.txt: " + outcome)
 
 
-def run_signup(muse_page):
-    """One signup attempt with Daniel's real email; the code comes from
-    the gist. Returns the outcome string."""
-    email = os.environ.get("MUSE_EMAIL", "").strip()
-    gist_url = os.environ.get("CODE_GIST_URL", "").strip()
+def run_signup():
+    """Run the signup. Returns the outcome string."""
+    email = os.environ.get("MUSE_EMAIL")
+    gist_url = os.environ.get("CODE_GIST_URL")
     if not email:
-        return "STOP: MUSE_EMAIL env var is not set"
+        return "STOP: MUSE_EMAIL env var not set"
     if not gist_url:
-        return "STOP: CODE_GIST_URL env var is not set"
-    log("MUSE_EMAIL: " + email)
-    log("CODE_GIST_URL: " + gist_url)
-    try:
-        muse_page.goto("https://muse.ai/", wait_until="domcontentloaded",
-                        timeout=60000)
-        muse_page.wait_for_timeout(5000)
-    except Exception as exc:
-        log("muse.ai load EXC: %r" % (exc,))
-        shot(muse_page, "step2-form.png")
-        return "STOP: muse.ai did not load"
-    log("muse.ai title: " + muse_page.title())
-    log("muse.ai url: " + muse_page.url)
-    if not fill_email(muse_page, email):
-        shot(muse_page, "step2-form.png")
-        return "STOP: email field not found on muse.ai"
-    log("email field filled")
-    shot(muse_page, "step2-form.png")
-    if not click_button(muse_page, ("Continue", "Next")):
-        shot(muse_page, "step3-after-continue.png")
-        return "STOP: Continue button not found on muse.ai"
-    log("Continue clicked")
-    muse_page.wait_for_timeout(2000)
-    shot(muse_page, "step3-after-continue.png")
-    state, waited = wait_next_step(muse_page)
-    log("next step after %ds: %s" % (waited, state))
-    shot(muse_page, "step4-verify.png")
-    tried = set()
-    deadline = None
-    while True:
-        log("state=%s" % state)
-        if state == "phone":
-            return "STOP: phone number asked for"
-        if state == "card":
-            return "STOP: payment card asked for"
-        if state == "captcha":
-            return "STOP: captcha/Turnstile shown"
-        if state == "rejected":
-            return "STOP: email rejected"
-        if state in ("success", "code-ok"):
-            save_account(email, "ACCOUNT CREATED (apparent)")
-            return "ACCOUNT CREATED (apparent)"
-        if state == "name":
-            if handle_name(muse_page):
-                click_button(muse_page, ("Continue", "Next", "Save"))
-                muse_page.wait_for_timeout(3000)
-                state, _ = wait_next_step(muse_page)
-                shot(muse_page, "step4-verify.png")
+        return "STOP: CODE_GIST_URL env var not set"
+    log("email=%s (from env)" % email)
+    log("gist=%s" % gist_url)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False, args=["--no-sandbox"])
+        ctx = browser.new_context(viewport={"width": 1280, "height": 800})
+        page = ctx.new_page()
+        log("opening muse.ai")
+        page.goto("https://muse.ai", timeout=60000)
+        page.wait_for_timeout(4000)
+        shot(page, "step2-form.png")
+        log("title=%r url=%s" % (page.title(), page.url))
+        if not fill_email(page, email):
+            shot(page, "step4-verify.png")
+            return "STOP: could not find the email field on muse.ai"
+        log("email filled")
+        if not click_button(page, ("Continue",)):
+            shot(page, "step4-verify.png")
+            return "STOP: could not find the Continue button"
+        shot(page, "step3-after-continue.png")
+        state, waited = wait_next_step(page)
+        log("after Continue: state=%s (waited %ds)" % (state, waited))
+        attempts = 0
+        while True:
+            if state == "phone":
+                shot(page, "step4-verify.png")
+                return "STOP: phone verification asked for"
+            if state == "card":
+                shot(page, "step4-verify.png")
+                return "STOP: payment card asked for"
+            if state == "captcha":
+                shot(page, "step4-verify.png")
+                return "STOP: captcha / human verification asked for"
+            if state == "rejected":
+                shot(page, "step4-verify.png")
+                return "STOP: email rejected by muse.ai"
+            if state == "exists":
+                shot(page, "step4-verify.png")
+                return "STOP: account already exists for this email"
+            if state == "password":
+                shot(page, "step4-verify.png")
+                return "STOP: password / sign-in asked for instead of a code"
+            if state == "success":
+                shot(page, "step4-verify.png")
+                return "ACCOUNT CREATED (apparent): success state reached"
+            if state == "name":
+                if not handle_name(page):
+                    shot(page, "step4-verify.png")
+                    return "STOP: name step shown but no name field found"
+                if not click_button(page, ("Continue", "Next", "Confirm")):
+                    shot(page, "step4-verify.png")
+                    return "STOP: name entered but no button to continue"
+                page.wait_for_timeout(4000)
+                state, _ = wait_next_step(page)
+                shot(page, "step4-verify.png")
                 continue
-            return "STOP: name step could not be completed"
-        if state == "birthday":
-            if handle_birthday(muse_page):
-                muse_page.wait_for_timeout(3000)
-                state, _ = wait_next_step(muse_page)
-                shot(muse_page, "step4-verify.png")
+            if state == "birthday":
+                if not handle_birthday(page):
+                    shot(page, "step4-verify.png")
+                    return "STOP: birthday step could not be completed"
+                state, waited = wait_leave_birthday(page)
+                shot(page, "step4-verify.png")
+                log("birthday step left after %ds, state=%s" % (waited, state))
+                if state == "birthday":
+                    return "STOP: birthday step did not complete after 90s"
+                if state == "other":
+                    return "STOP: unrecognised state after birthday Confirm: other"
                 continue
-            return "STOP: birthday step could not be completed"
-        if state == "code":
-            if deadline is None:
-                deadline = time.time() + GIST_WAIT_SECONDS
-                log("polling the gist for the code for up to 25 minutes")
-            code = poll_gist_code(gist_url, tried, deadline)
-            if not code:
-                return "STOP: no code in the gist after 25 minutes"
-            if not enter_code(muse_page, code):
-                shot(muse_page, "step4-verify.png")
-                return "STOP: could not enter the verification code"
-            log("code entered, pressing Enter")
-            try:
-                muse_page.keyboard.press("Enter")
-            except Exception as exc:
-                log("Enter press EXC: %r" % (exc,))
-            muse_page.wait_for_timeout(3000)
-            state, _ = wait_next_step(muse_page)
-            shot(muse_page, "step4-verify.png")
             if state == "code":
-                if click_button(muse_page, ("Verify", "Continue", "Next", "Submit")):
-                    muse_page.wait_for_timeout(3000)
-                    state, _ = wait_next_step(muse_page)
-                    shot(muse_page, "step4-verify.png")
-            if state == "code":
-                log("code was not accepted, waiting for a new code in the gist")
-                tried.add(code)
+                attempts += 1
+                log("verification code step reached (round %d)" % attempts)
+                code = poll_gist_code(page, gist_url)
+                if code is None:
+                    shot(page, "step4-verify.png")
+                    return "STOP: no verification code in the gist after 25 minutes"
+                if not enter_code(page, code):
+                    shot(page, "step4-verify.png")
+                    return "STOP: could not enter the verification code"
+                log("code entered")
+                page.keyboard.press("Enter")
+                state, waited = wait_next_step(page)
+                log("after code: state=%s (waited %ds)" % (state, waited))
+                shot(page, "step4-verify.png")
                 continue
-            continue
-        log("unrecognised state %r, stopping" % state)
-        return "STOP: unrecognised state after Continue: " + state
+            shot(page, "step4-verify.png")
+            return "STOP: unrecognised state after Continue: " + state
 
 
 def main():
-    log("=== muse-signup-desktop start ===")
-    outcome = "STOP: playwright did not start"
     try:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=False, args=["--no-sandbox"])
-            context = browser.new_context(viewport={"width": 1280, "height": 800})
-            muse_page = context.new_page()
-            try:
-                outcome = run_signup(muse_page)
-            except Exception as exc:
-                log("run EXC: %r" % (exc,))
-                outcome = "STOP: script error: %r" % (exc,)
-                try:
-                    shot(muse_page, "step4-verify.png")
-                except Exception:
-                    pass
-            browser.close()
+        outcome = run_signup()
     except Exception as exc:
-        log("playwright EXC: %r" % (exc,))
-        outcome = "STOP: playwright error: %r" % (exc,)
-    log("OUTCOME: " + outcome)
-    log("=== muse-signup-desktop end ===")
-    return 0
+        log("EXC: %r" % (exc,))
+        outcome = "STOP: unexpected error: %r" % (exc,)
+    log(outcome)
+    email = os.environ.get("MUSE_EMAIL", "")
+    try:
+        save_account(email, outcome)
+    except Exception as exc:
+        log("save account EXC: %r" % (exc,))
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
