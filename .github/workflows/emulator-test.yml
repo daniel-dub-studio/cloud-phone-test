@@ -11,6 +11,12 @@ jobs:
           ls -l /dev/kvm || echo "NO KVM DEVICE"
           grep -c -E 'vmx|svm' /proc/cpuinfo || true
           curl -s ifconfig.me; echo
+      - name: Enable KVM group perms
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
       - name: Boot emulator
         uses: reactivecircus/android-emulator-runner@v2
         with:
