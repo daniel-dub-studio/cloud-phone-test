@@ -39,9 +39,13 @@ jobs:
             adb shell pm list packages | grep aura || echo NOT_INSTALLED
             echo "--- launching ---"
             adb shell monkey -p com.facebook.aura -c android.intent.category.LAUNCHER 1 || echo LAUNCH_FAILED
-            sleep 10
+            sleep 30
             adb exec-out screencap -p > /tmp/muse-open.png
-            ls -la /tmp/screen.png /tmp/muse-open.png
+            adb shell pidof com.facebook.aura || echo APP_NOT_RUNNING
+            echo "--- logcat aura/crash ---"
+            adb logcat -d | grep -iE "aura|AndroidRuntime|FATAL" | tail -40 || true
+            adb exec-out screencap -p > /tmp/muse-open2.png
+            ls -la /tmp/screen.png /tmp/muse-open.png /tmp/muse-open2.png
       - name: Upload screenshots
         uses: actions/upload-artifact@v4
         with:
@@ -49,3 +53,4 @@ jobs:
           path: |
             /tmp/screen.png
             /tmp/muse-open.png
+            /tmp/muse-open2.png
