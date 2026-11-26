@@ -31,8 +31,10 @@ jobs:
             sleep 5
             adb exec-out screencap -p > /tmp/screen.png
             adb shell am start -a android.intent.action.VIEW -d https://muse.ai
-            sleep 5
+            sleep 12
             adb shell input tap 540 2180
+            sleep 5
+            adb shell am start -a android.intent.action.VIEW -d https://muse.ai
             sleep 20
             adb exec-out screencap -p > /tmp/muse-ai.png
             adb shell dumpsys window windows | grep -i mCurrentFocus || true
