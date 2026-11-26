@@ -24,6 +24,15 @@ Fixes over the first version (from run #2):
   input field (EditText with usable bounds). The word "password" merely
   appearing in page text no longer triggers any typing.
 
+Fixes in this version (from run #3):
+- Wait for temp.tf to render before touching providers: re-dump in a loop
+  until the dump has more than 100 nodes or "gmail.com" is present. Acting on
+  the first 43-node dump is what broke run #3.
+- Use fixed coordinates for the provider checkboxes and NEW ADDRESS, because
+  the dump gives them no usable bounds: uncheck outlook.com (118,765),
+  hotmail.com (418,765) and high.edu.pl (118,828); leave gmail.com checked;
+  tap NEW ADDRESS at (322,1031).
+
 The script never raises out of main: every failure is logged, a screenshot is
 taken, and it exits 0 so the workflow still uploads the artifacts.
 """
@@ -234,22 +243,15 @@ def random_password(length=12):
     return "".join(random.choice(alphabet) for _ in range(length))
 
 
-def set_provider(lines, name, want_checked):
-    """Set a temp.tf provider checkbox to the wanted state."""
+def provider_checked(lines, name):
+    """Checked state of a temp.tf provider checkbox, read from the dump.
+    True, False, or None when the provider is not in the dump."""
     nodes = find_lines(lines, name)
     boxes = [ln for ln in nodes if "CheckBox" in ln]
     target = boxes[0] if boxes else (nodes[0] if nodes else None)
     if target is None:
-        log("provider %s: no node found" % name)
-        return False
-    cur = node_checked(target)
-    log("provider %s: checked=%s want=%s" % (name, cur, want_checked))
-    if cur is None or cur == want_checked:
-        return True
-    if tap_line(target):
-        log("provider %s: tapped to change state" % name)
-        return True
-    return False
+        return None
+    return node_checked(target)
 
 
 def still_on_form(lines):
@@ -439,34 +441,36 @@ def run_signup():
     screencap("step1.png")
     lines = dump("dump-step1")
 
-    # (b) temp email, gmail.com only. temp.tf pre-checks every provider, so
-    # uncheck outlook.com, hotmail.com and high.edu.pl, check ONLY gmail.com,
-    # then tap NEW ADDRESS to generate a gmail.com address.
-    email = extract_email(lines, domain="gmail.com")
-    if not email:
-        set_provider(lines, "outlook.com", False)
-        sleep(1)
-        set_provider(lines, "hotmail.com", False)
-        sleep(1)
-        set_provider(lines, "high.edu.pl", False)
-        sleep(1)
-        set_provider(lines, "gmail.com", True)
-        sleep(2)
-        new_addr = find_lines(lines, "NEW ADDRESS")
-        if new_addr:
-            log("tapping NEW ADDRESS to generate a gmail.com address")
-            tap_line(new_addr[0])
+    # (b) temp email, gmail.com only. First wait for temp.tf to render: the
+    # first dump is taken before the page loads (43 nodes) and has no
+    # providers in it. Re-dump until the dump has more than 100 nodes or
+    # "gmail.com" is present.
+    for attempt in range(6):
+        if len(lines) > 100 or any("gmail.com" in ln for ln in lines):
+            break
+        log("temp.tf not rendered yet (only %d nodes), waiting (attempt %d)" % (len(lines), attempt + 1))
         sleep(5)
-        lines = dump("dump-step1b")
-        email = extract_email(lines, domain="gmail.com")
+        lines = dump("dump-step1-wait%d" % (attempt + 1))
+    # Uncheck every provider except gmail.com, using fixed coordinates: the
+    # dump gives the checkboxes no usable bounds. gmail.com stays checked.
+    #   outlook.com (118,765), hotmail.com (418,765), high.edu.pl (118,828)
+    for name, x, y in (("outlook.com", 118, 765), ("hotmail.com", 418, 765), ("high.edu.pl", 118, 828)):
+        state = provider_checked(lines, name)
+        log("provider %s: checked=%s" % (name, state))
+        if state is not False:
+            tap(x, y)
+            sleep(1)
+    log("provider gmail.com: checked=%s (left checked)" % provider_checked(lines, "gmail.com"))
+    tap(322, 1031)  # NEW ADDRESS: generate a gmail.com address
+    sleep(3)
+    lines = dump("dump-step1b")
+    email = extract_email(lines, domain="gmail.com")
     for attempt in range(3):
         if email:
             break
         log("gmail.com email not found yet, retry %d" % (attempt + 1))
-        new_addr = find_lines(lines, "NEW ADDRESS")
-        if new_addr:
-            tap_line(new_addr[0])
-        sleep(8)
+        tap(322, 1031)  # NEW ADDRESS again
+        sleep(3)
         lines = dump("dump-step1-retry%d" % (attempt + 1))
         email = extract_email(lines, domain="gmail.com")
     if not email:
