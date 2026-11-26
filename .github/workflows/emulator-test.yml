@@ -40,11 +40,15 @@ jobs:
             adb shell pm list packages | grep io.elevenlabs.coreapp || echo NOT_INSTALLED
             echo "--- launching ---"
             adb shell monkey -p io.elevenlabs.coreapp -c android.intent.category.LAUNCHER 1 || echo LAUNCH_FAILED
+            sleep 3
+            adb exec-out screencap -p > /tmp/eleven-early.png
+            adb shell dumpsys window windows | grep -i mCurrentFocus || true
+            adb shell dumpsys activity activities | grep -i elevenlabs | head -10 || true
             sleep 30
             adb exec-out screencap -p > /tmp/muse-open.png
             adb shell pidof io.elevenlabs.coreapp || echo APP_NOT_RUNNING
             echo "--- logcat elevenlabs/crash ---"
-            adb logcat -d | grep -iE "io.elevenlabs.coreapp|AndroidRuntime|FATAL" | tail -40 || true
+            adb logcat -d | grep -iE "io.elevenlabs.coreapp|AndroidRuntime|FATAL" | tail -80 || true
             adb exec-out screencap -p > /tmp/muse-open2.png
             ls -la /tmp/screen.png /tmp/muse-open.png /tmp/muse-open2.png
       - name: Upload screenshots
@@ -55,3 +59,4 @@ jobs:
             /tmp/screen.png
             /tmp/muse-open.png
             /tmp/muse-open2.png
+            /tmp/eleven-early.png
