@@ -18,20 +18,26 @@ Fixes over the first version (from run #2):
   Continue. The form is driven with fixed coordinates on a 1080x2340 screen:
   email field centre (287,1710), Continue button centre (120,1955).
 - temp.tf pre-checks every email provider, so the address came out as
-  hotmail.com/outlook.com. Uncheck outlook.com, hotmail.com and high.edu.pl
-  and check ONLY gmail.com, then tap NEW ADDRESS, so the address is gmail.com.
+  hotmail.com/outlook.com. A gmail.com address is obtained with the
+  NEW ADDRESS loop described in the run #4 fix below.
 - A password is only typed when a fresh screen actually shows a real password
   input field (EditText with usable bounds). The word "password" merely
   appearing in page text no longer triggers any typing.
 
-Fixes in this version (from run #3):
-- Wait for temp.tf to render before touching providers: re-dump in a loop
+Fixes from run #3 (kept):
+- Wait for temp.tf to render before generating an address: re-dump in a loop
   until the dump has more than 100 nodes or "gmail.com" is present. Acting on
   the first 43-node dump is what broke run #3.
-- Use fixed coordinates for the provider checkboxes and NEW ADDRESS, because
-  the dump gives them no usable bounds: uncheck outlook.com (118,765),
-  hotmail.com (418,765) and high.edu.pl (118,828); leave gmail.com checked;
-  tap NEW ADDRESS at (322,1031).
+- The dump gives the NEW ADDRESS button no usable bounds, so it is tapped at
+  fixed coordinates (322,1031) on a 1080x2340 screen.
+
+Fixes in this version (from run #4):
+- Drop the checkbox unchecking entirely: fixed-coordinate taps on the
+  provider boxes are unreliable (run #4: only hotmail.com actually toggled;
+  outlook.com and high.edu.pl stayed checked). All four providers stay
+  checked, so NEW ADDRESS picks a random provider each time: tap it in a
+  loop up to 15 times, re-dumping after each tap, until the generated
+  address ends with @gmail.com.
 
 The script never raises out of main: every failure is logged, a screenshot is
 taken, and it exits 0 so the workflow still uploads the artifacts.
@@ -451,28 +457,21 @@ def run_signup():
         log("temp.tf not rendered yet (only %d nodes), waiting (attempt %d)" % (len(lines), attempt + 1))
         sleep(5)
         lines = dump("dump-step1-wait%d" % (attempt + 1))
-    # Uncheck every provider except gmail.com, using fixed coordinates: the
-    # dump gives the checkboxes no usable bounds. gmail.com stays checked.
-    #   outlook.com (118,765), hotmail.com (418,765), high.edu.pl (118,828)
-    for name, x, y in (("outlook.com", 118, 765), ("hotmail.com", 418, 765), ("high.edu.pl", 118, 828)):
-        state = provider_checked(lines, name)
-        log("provider %s: checked=%s" % (name, state))
-        if state is not False:
-            tap(x, y)
-            sleep(1)
-    log("provider gmail.com: checked=%s (left checked)" % provider_checked(lines, "gmail.com"))
-    tap(322, 1031)  # NEW ADDRESS: generate a gmail.com address
-    sleep(3)
-    lines = dump("dump-step1b")
-    email = extract_email(lines, domain="gmail.com")
-    for attempt in range(3):
-        if email:
-            break
-        log("gmail.com email not found yet, retry %d" % (attempt + 1))
-        tap(322, 1031)  # NEW ADDRESS again
+    # No checkbox unchecking: fixed-coordinate taps on the provider boxes
+    # are unreliable (run #4: only hotmail.com actually toggled). All four
+    # providers stay checked, so NEW ADDRESS picks a random one each time.
+    # Tap NEW ADDRESS up to 15 times, re-dumping after each tap, until the
+    # address ends with @gmail.com.
+    email = None
+    for attempt in range(15):
+        tap(322, 1031)  # NEW ADDRESS
         sleep(3)
-        lines = dump("dump-step1-retry%d" % (attempt + 1))
+        lines = dump("dump-step1-try%d" % (attempt + 1))
         email = extract_email(lines, domain="gmail.com")
+        if email:
+            log("gmail.com address found on NEW ADDRESS attempt %d" % (attempt + 1))
+            break
+        log("attempt %d: no gmail.com address yet" % (attempt + 1))
     if not email:
         log("STOP: no gmail.com temp email found on temp.tf")
         screencap("step4-blocked.png")
