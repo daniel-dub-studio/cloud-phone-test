@@ -31,13 +31,28 @@ Fixes from run #3 (kept):
 - The dump gives the NEW ADDRESS button no usable bounds, so it is tapped at
   fixed coordinates (322,1031) on a 1080x2340 screen.
 
-Fixes in this version (from run #4):
+Fixes from run #4 (kept):
 - Drop the checkbox unchecking entirely: fixed-coordinate taps on the
   provider boxes are unreliable (run #4: only hotmail.com actually toggled;
   outlook.com and high.edu.pl stayed checked). All four providers stay
   checked, so NEW ADDRESS picks a random provider each time: tap it in a
   loop up to 15 times, re-dumping after each tap, until the generated
   address ends with @gmail.com.
+
+Fixes in this version (from run #5):
+- Raise the NEW ADDRESS loop cap from 15 to 25 attempts: the gmail.com
+  address only appeared on attempt 15 last time, too close to the cap.
+- The tap at (287,1710) never focused the email field in run #5 (step3.png
+  shows the field empty, no keyboard, orange focus ring around the whole
+  WebView), so the typed text went nowhere. Now the field is tapped in a
+  focus loop of up to 5 attempts -- (287,1710), (200,1710), a 300ms
+  long-press at (287,1710), then (287,1710) and (200,1710) again -- and
+  the email is only typed after `adb shell dumpsys input_method`
+  confirms the soft keyboard is visible. If the keyboard never appears,
+  stop at step4-blocked instead of typing blindly.
+- Never press Back blindly: after Enter, Back is pressed only when
+  dumpsys still shows the keyboard up. In run #5 the keyboard was already
+  down, so Back exited Chrome to the home screen.
 
 The script never raises out of main: every failure is logged, a screenshot is
 taken, and it exits 0 so the workflow still uploads the artifacts.
@@ -142,6 +157,52 @@ def node_checked(line):
     if not m:
         return None
     return m.group(1) == "true"
+
+
+def keyboard_visible():
+    """True when the soft keyboard is up, judged from dumpsys input_method.
+
+    The input method window is listed with a shown/visible state; when the
+    keyboard is down the window is hidden. The matching lines are logged
+    so the run log shows what was seen.
+    """
+    rc, out, err = adb_shell("dumpsys", "input_method")
+    blob = out + err
+    low = blob.lower()
+    for ln in blob.splitlines():
+        if "inputmethodwindow" in ln.lower():
+            log("IME: " + ln.strip()[:200])
+    if "minputmethodwindow" not in low:
+        log("keyboard check: no input method window in dumpsys")
+        return False
+    visible = ("mshown=true" in low or "isvisible=true" in low
+               or "mvisible=true" in low or "mhasSurface=true" in low)
+    log("keyboard check: visible=%s" % visible)
+    return visible
+
+
+def focus_email_field():
+    """Tap the muse.ai email field until the soft keyboard is visible.
+
+    Returns True once the keyboard is confirmed up. The tap at (287,1710)
+    never focused the input in run #5, so alternate the taps: (287,1710),
+    (200,1710), a 300ms long-press at (287,1710), then (287,1710) and
+    (200,1710) again. Returns False after 5 attempts without a keyboard.
+    """
+    attempts = [(287, 1710), (200, 1710), "longpress", (287, 1710), (200, 1710)]
+    for i, action in enumerate(attempts, start=1):
+        if action == "longpress":
+            log("FOCUS attempt %d: long-press (287,1710) 300ms" % i)
+            adb_shell("input", "swipe", "287", "1710", "287", "1710", "300")
+        else:
+            log("FOCUS attempt %d" % i)
+            tap(action[0], action[1])
+        sleep(2)
+        if keyboard_visible():
+            log("keyboard visible after focus attempt %d" % i)
+            return True
+        log("keyboard not visible after focus attempt %d" % i)
+    return False
 
 
 def dump(name):
@@ -320,8 +381,10 @@ def enter_code_on_muse(email, code):
     lines = dump("dump-step4")
     if find_lines(lines, "mobile number or email"):
         log("muse.ai shows the email screen again, re-entering the email")
-        tap(287, 1710)  # email field centre, same fixed coordinates as step (c)
-        sleep(2)
+        if not focus_email_field():
+            log("STOP: keyboard never appeared after tapping the email field")
+            screencap("step4-blocked.png")
+            return lines
         type_text(email)
         sleep(2)
         adb_shell("input", "keyevent", "66")  # Enter
@@ -460,10 +523,10 @@ def run_signup():
     # No checkbox unchecking: fixed-coordinate taps on the provider boxes
     # are unreliable (run #4: only hotmail.com actually toggled). All four
     # providers stay checked, so NEW ADDRESS picks a random one each time.
-    # Tap NEW ADDRESS up to 15 times, re-dumping after each tap, until the
+    # Tap NEW ADDRESS up to 25 times, re-dumping after each tap, until the
     # address ends with @gmail.com.
     email = None
-    for attempt in range(15):
+    for attempt in range(25):
         tap(322, 1031)  # NEW ADDRESS
         sleep(3)
         lines = dump("dump-step1-try%d" % (attempt + 1))
@@ -483,12 +546,17 @@ def run_signup():
     # WebView whose inner elements have no bounds in the dump, so dump-based
     # taps cannot focus the field or press Continue. Coordinates are the field
     # and button centres on a 1080x2340 screen, read from step2.png of run #2.
+    # The field is only typed into once the soft keyboard is confirmed
+    # visible (focus_email_field); in run #5 the tap never focused the
+    # input and the typed text went nowhere.
     open_url("https://muse.ai")
     sleep(15)
     screencap("step2.png")
     lines = dump("dump-step2")
-    tap(287, 1710)  # email field centre
-    sleep(2)
+    if not focus_email_field():
+        log("STOP: keyboard never appeared after tapping the email field")
+        screencap("step4-blocked.png")
+        return
     type_text(email)
     sleep(2)
     adb_shell("input", "keyevent", "66")  # Enter: submit the form
@@ -496,9 +564,13 @@ def run_signup():
     screencap("step3.png")
     lines = dump("dump-step3")
     if still_on_form(lines):
-        log("still on the email form after Enter, hiding keyboard and tapping Continue")
-        adb_shell("input", "keyevent", "4")  # Back: hide the keyboard
-        sleep(2)
+        log("still on the email form after Enter")
+        if keyboard_visible():
+            log("keyboard still visible, pressing Back to hide it")
+            adb_shell("input", "keyevent", "4")  # Back: hide the keyboard
+            sleep(2)
+        else:
+            log("keyboard already down, skipping Back (Back would exit Chrome)")
         tap(120, 1955)  # Continue button centre
         sleep(8)
         screencap("step4-continue.png")
