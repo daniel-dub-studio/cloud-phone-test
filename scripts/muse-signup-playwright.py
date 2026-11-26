@@ -12,11 +12,17 @@ Flow:
   2. muse.ai in a new tab: fill "Mobile number or email", click Continue.
      Screenshots step2-form.png (before) and step3-after-continue.png.
   3. Wait up to 60 s for the next step. If a verification code is asked
-     for, fetch it from the temp.tf inbox (FETCH INBOX) and enter it.
-     If a name is asked for, enter "Muse".
+     for, fetch it from the temp.tf inbox (FETCH INBOX): check for up to
+     5 minutes, every ~15 s, accepting mail from any sender. If a code is
+     found, enter it; if a verification link is found instead, open it
+     in the muse.ai tab. If a name is asked for, enter "Muse".
   4. STOP (screenshot step4-verify.png, log the reason, do not proceed) if
      a phone number, a payment card, a captcha/Turnstile, or a rejected
      temp email is asked for.
+
+Run #2 change: the inbox wait is 5 minutes, every ~15 s (was 90 s), and
+mail from any sender is accepted -- run #1 only looked for "Muse", so a
+code from Meta or noreply would have been missed.
 
 Outputs (all under /tmp, uploaded as the muse-signup-desktop artifact):
   muse-account.txt, step1-temp.png, step2-form.png,
@@ -307,13 +313,56 @@ def wait_next_step(page, seconds=60):
     return body_text(page).lower()
 
 
+def find_link(page, text):
+    """An absolute verification/confirm link: first from anchor hrefs,
+    then from any URL printed in the page text. None when there is none."""
+    try:
+        for a in page.locator("a").all():
+            try:
+                href = a.get_attribute("href") or ""
+            except Exception:
+                continue
+            low = href.lower()
+            if href.startswith("http") and any(w in low for w in ("verif", "confirm", "activate", "muse")):
+                return href
+    except Exception:
+        pass
+    for m in re.finditer(r"https?://[^\s\"'<>]+", text):
+        url = m.group(0)
+        low = url.lower()
+        if any(w in low for w in ("verif", "confirm", "activate", "muse")):
+            return url
+    return None
+
+
+def open_newest_message(page):
+    """Click the first plausible inbox row, to open the newest message.
+    Returns True when a row was clicked."""
+    for sel in ("tbody tr", "[class*='inbox-item' i]", "[class*='mail-item' i]",
+                "[class*='message-item' i]", "[class*='email-item' i]"):
+        try:
+            loc = page.locator(sel).first
+            if loc.count():
+                loc.click(timeout=5000)
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def fetch_code(temp_page):
-    """Fetch the Muse verification code from the temp.tf inbox."""
+    """Fetch the Muse verification code (or link) from the temp.tf inbox.
+
+    Checks for up to 5 minutes, every ~15 s. Accepts mail from ANY sender:
+    the inbox text is scanned for a 6-digit code and for a verification
+    link, and the newest message is opened and scanned when the list text
+    holds neither. Returns (value, kind) where kind is "code", "link",
+    or None when nothing arrived.
+    """
     temp_page.bring_to_front()
     temp_page.wait_for_timeout(2000)
-    code = None
-    deadline = time.time() + 90
-    while time.time() < deadline and not code:
+    deadline = time.time() + 300
+    while time.time() < deadline:
         loc = temp_page.get_by_role("button", name="FETCH INBOX", exact=True).first
         try:
             if loc.count():
@@ -324,21 +373,32 @@ def fetch_code(temp_page):
             log("FETCH INBOX click EXC: %r" % (exc,))
         temp_page.wait_for_timeout(4000)
         text = body_text(temp_page)
-        if "muse" not in text.lower():
-            log("no Muse email in the inbox yet")
-            temp_page.wait_for_timeout(5000)
-            continue
-        try:
-            temp_page.get_by_text("Muse").first.click(timeout=10000)
-            temp_page.wait_for_timeout(3000)
-        except Exception as exc:
-            log("Muse email click EXC: %r" % (exc,))
-        code = find_code(body_text(temp_page))
+        squashed = " ".join(text.split())
+        log("inbox: " + squashed[:500])
+        code = find_code(text)
         if code:
-            break
-        log("Muse email opened, no code readable yet")
-        temp_page.wait_for_timeout(5000)
-    return code
+            log("code found in the inbox list")
+            return code, "code"
+        link = find_link(temp_page, text)
+        if link:
+            log("verification link found in the inbox list: " + link)
+            return link, "link"
+        # No code/link in the list text: open the newest message and scan it.
+        if open_newest_message(temp_page):
+            temp_page.wait_for_timeout(3000)
+            text = body_text(temp_page)
+            code = find_code(text)
+            if code:
+                log("code found in the opened message")
+                return code, "code"
+            link = find_link(temp_page, text)
+            if link:
+                log("verification link found in the opened message: " + link)
+                return link, "link"
+            log("opened message has no code or link")
+        temp_page.wait_for_timeout(11000)
+    log("no verification code or link arrived in 5 minutes")
+    return None, None
 
 
 def enter_code(page, code):
@@ -432,15 +492,23 @@ def run_signup():
                     break
                 if state == "code":
                     log("verification code requested, fetching it from the temp inbox")
-                    code = fetch_code(temp_page)
-                    if not code:
+                    value, kind = fetch_code(temp_page)
+                    if kind is None:
                         log("STOP: no verification code arrived")
                         outcome = "verification code never arrived"
                         break
-                    log("VERIFICATION CODE: " + code)
                     page.bring_to_front()
                     page.wait_for_timeout(1000)
-                    if not enter_code(page, code):
+                    if kind == "link":
+                        log("verification link found, opening it in the muse.ai tab")
+                        try:
+                            page.goto(value, wait_until="domcontentloaded", timeout=60000)
+                        except Exception as exc:
+                            log("verification link open EXC: %r" % (exc,))
+                        page.wait_for_timeout(5000)
+                        continue
+                    log("VERIFICATION CODE: " + value)
+                    if not enter_code(page, value):
                         log("STOP: could not enter the verification code")
                         outcome = "could not enter the verification code"
                         break
