@@ -5,11 +5,24 @@ Runs on the GitHub Actions runner with the emulator already booted. Drives the
 emulator with adb via subprocess. Plain Python only -- no heredoc anywhere.
 
 Outputs (all under /tmp, uploaded as the muse-signup artifact):
-  screen.png, step1.png, step2.png, step3.png, step4-verify.png or
-  step4-blocked.png, step5-inbox.png, muse-account.txt, dump-*.xml
+  screen.png, step1.png, step2.png, step3.png, step4-continue.png,
+  step4-verify.png or step4-blocked.png, step5-inbox.png,
+  muse-account.txt, dump-*.xml
 
 The account is for Muse (the assistant), not for the repo owner: if any signup
 step asks for a name, enter "Muse".
+
+Fixes over the first version (from run #2):
+- muse.ai renders in a WebView whose inner elements have no bounds in the
+  uiautomator dump, so dump-based taps cannot focus the email field or press
+  Continue. The form is driven with fixed coordinates on a 1080x2340 screen:
+  email field centre (287,1710), Continue button centre (120,1955).
+- temp.tf pre-checks every email provider, so the address came out as
+  hotmail.com/outlook.com. Uncheck outlook.com, hotmail.com and high.edu.pl
+  and check ONLY gmail.com, then tap NEW ADDRESS, so the address is gmail.com.
+- A password is only typed when a fresh screen actually shows a real password
+  input field (EditText with usable bounds). The word "password" merely
+  appearing in page text no longer triggers any typing.
 
 The script never raises out of main: every failure is logged, a screenshot is
 taken, and it exits 0 so the workflow still uploads the artifacts.
@@ -27,6 +40,13 @@ EMAIL_RE = re.compile("[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+[.][A-Za-z]{2,}")
 BOUNDS_RE = re.compile('bounds="[(]([0-9]+),([0-9]+)[)][(]([0-9]+),([0-9]+)[)]"')
 CODE6_RE = re.compile("(?<![0-9])([0-9]{6})(?![0-9])")
 CODE_ANY_RE = re.compile("(?<![0-9])([0-9]{4,8})(?![0-9])")
+CHECKED_RE = re.compile('checked="(true|false)"')
+SUBMITTED_WORDS = ("verification code", "enter the code", "check your email",
+                   "check your inbox", "we sent", "sent you a code",
+                   "verify your phone", "phone verification", "enter your phone",
+                   "sms code", "texted you", "captcha", "not a robot",
+                   "verify you are human", "welcome", "account created",
+                   "get started", "your account is ready", "dashboard")
 
 
 def log(msg):
@@ -102,6 +122,13 @@ def tap_line(line):
     return True
 
 
+def node_checked(line):
+    m = CHECKED_RE.search(line)
+    if not m:
+        return None
+    return m.group(1) == "true"
+
+
 def dump(name):
     """Dump the screen; the raw dump is one line, so split it first.
 
@@ -152,7 +179,13 @@ def find_button(lines, label):
     return find_lines(lines, label)
 
 
-def extract_email(lines):
+def extract_email(lines, domain=None):
+    if domain:
+        for ln in lines:
+            m = EMAIL_RE.search(ln)
+            if m and m.group(0).lower().endswith("@" + domain.lower()):
+                return m.group(0)
+        return None
     for ln in lines:
         m = EMAIL_RE.search(ln)
         if m:
@@ -199,6 +232,35 @@ def save_account(email, password=None):
 def random_password(length=12):
     alphabet = string.ascii_letters + string.digits
     return "".join(random.choice(alphabet) for _ in range(length))
+
+
+def set_provider(lines, name, want_checked):
+    """Set a temp.tf provider checkbox to the wanted state."""
+    nodes = find_lines(lines, name)
+    boxes = [ln for ln in nodes if "CheckBox" in ln]
+    target = boxes[0] if boxes else (nodes[0] if nodes else None)
+    if target is None:
+        log("provider %s: no node found" % name)
+        return False
+    cur = node_checked(target)
+    log("provider %s: checked=%s want=%s" % (name, cur, want_checked))
+    if cur is None or cur == want_checked:
+        return True
+    if tap_line(target):
+        log("provider %s: tapped to change state" % name)
+        return True
+    return False
+
+
+def still_on_form(lines):
+    """True when the dump still shows the muse.ai email form and nothing
+    that would mean the form was already submitted."""
+    blob = NL.join(lines).lower()
+    if "mobile number or email" not in blob:
+        return False
+    if any(w in blob for w in SUBMITTED_WORDS):
+        return False
+    return True
 
 
 def fetch_code_from_inbox():
@@ -250,16 +312,11 @@ def enter_code_on_muse(email, code):
     lines = dump("dump-step4")
     if find_lines(lines, "mobile number or email"):
         log("muse.ai shows the email screen again, re-entering the email")
-        field = find_lines(lines, "mobile number or email")
-        edit = [ln for ln in field if "EditText" in ln]
-        target = edit[0] if edit else field[0]
-        tap_line(target)
+        tap(287, 1710)  # email field centre, same fixed coordinates as step (c)
         sleep(2)
         type_text(email)
         sleep(2)
-        cont = find_button(lines, "Continue")
-        if cont:
-            tap_line(cont[0])
+        adb_shell("input", "keyevent", "66")  # Enter
         sleep(8)
         lines = dump("dump-step4b")
     code_field = find_lines(lines, "code")
@@ -272,7 +329,10 @@ def enter_code_on_muse(email, code):
         log("STOP: no code field found on muse.ai")
         screencap("step4-blocked.png")
         return lines
-    tap_line(target)
+    if not tap_line(target):
+        log("STOP: code field has no usable bounds, cannot enter the code")
+        screencap("step4-blocked.png")
+        return lines
     sleep(2)
     type_text(code)
     sleep(2)
@@ -287,28 +347,42 @@ def enter_code_on_muse(email, code):
 
 
 def handle_profile_setup(lines, email):
-    """Fill a name field with Muse and/or a generated password if asked."""
+    """Fill a name field with Muse and/or a generated password, but only
+    when the field is a real, tappable input (EditText with usable bounds).
+    Never type into a field the script could not focus."""
     acted = False
-    pw_fields = find_lines(lines, "password")
-    pw_edit = [ln for ln in pw_fields if "EditText" in ln]
-    if pw_edit:
+    pw_edit = [ln for ln in find_lines(lines, "password") if "EditText" in ln]
+    pw_target = None
+    for ln in pw_edit:
+        if node_centre(ln) is not None:
+            pw_target = ln
+            break
+    if pw_target is not None:
         pw = random_password()
         log("password field found, filling a generated password")
-        tap_line(pw_edit[0])
-        sleep(2)
-        type_text(pw)
-        save_account(email, pw)
-        acted = True
-        sleep(2)
-    name_fields = find_lines(lines, "name")
-    name_edit = [ln for ln in name_fields if "EditText" in ln]
-    if name_edit:
+        if tap_line(pw_target):
+            sleep(2)
+            type_text(pw)
+            save_account(email, pw)
+            acted = True
+            sleep(2)
+    elif pw_edit:
+        log("password field visible but has no usable bounds, cannot fill it")
+    name_edit = [ln for ln in find_lines(lines, "name") if "EditText" in ln]
+    name_target = None
+    for ln in name_edit:
+        if node_centre(ln) is not None:
+            name_target = ln
+            break
+    if name_target is not None:
         log("name field found, entering Muse")
-        tap_line(name_edit[0])
-        sleep(2)
-        type_text("Muse")
-        acted = True
-        sleep(2)
+        if tap_line(name_target):
+            sleep(2)
+            type_text("Muse")
+            acted = True
+            sleep(2)
+    elif name_edit:
+        log("name field visible but has no usable bounds, cannot fill it")
     if acted:
         cont = find_button(lines, "Continue") or find_button(lines, "Create account")
         if cont:
@@ -335,10 +409,14 @@ def finish(lines, email):
         log("ACCOUNT CREATED (apparent): muse.ai shows a success/welcome screen")
         screencap("step4-verify.png")
         return
-    name_edit = [ln for ln in find_lines(lines, "name") if "EditText" in ln]
-    pw_edit = [ln for ln in find_lines(lines, "password") if "EditText" in ln]
+    # Only handle a password/name step when a fresh screen actually shows a
+    # real input field for it. The word alone in page text is not a field.
+    screencap("step4-profile.png")
+    fresh = dump("dump-step4-profile")
+    name_edit = [ln for ln in find_lines(fresh, "name") if "EditText" in ln]
+    pw_edit = [ln for ln in find_lines(fresh, "password") if "EditText" in ln]
     if name_edit or pw_edit:
-        lines = handle_profile_setup(lines, email)
+        lines = handle_profile_setup(fresh, email)
         blob = NL.join(lines).lower()
         if any(w in blob for w in ("welcome", "account created", "get started",
                                    "your account is ready", "dashboard")):
@@ -361,62 +439,70 @@ def run_signup():
     screencap("step1.png")
     lines = dump("dump-step1")
 
-    # (b) read the temp email (pick the gmail.com provider first if offered)
-    email = extract_email(lines)
+    # (b) temp email, gmail.com only. temp.tf pre-checks every provider, so
+    # uncheck outlook.com, hotmail.com and high.edu.pl, check ONLY gmail.com,
+    # then tap NEW ADDRESS to generate a gmail.com address.
+    email = extract_email(lines, domain="gmail.com")
     if not email:
-        provider = find_lines(lines, "gmail.com", clickable=True)
-        if not provider:
-            provider = find_lines(lines, "gmail.com")
-        if provider:
-            log("provider choice offered, tapping gmail.com")
-            tap_line(provider[0])
-            sleep(5)
-            lines = dump("dump-step1b")
-            email = extract_email(lines)
+        set_provider(lines, "outlook.com", False)
+        sleep(1)
+        set_provider(lines, "hotmail.com", False)
+        sleep(1)
+        set_provider(lines, "high.edu.pl", False)
+        sleep(1)
+        set_provider(lines, "gmail.com", True)
+        sleep(2)
+        new_addr = find_lines(lines, "NEW ADDRESS")
+        if new_addr:
+            log("tapping NEW ADDRESS to generate a gmail.com address")
+            tap_line(new_addr[0])
+        sleep(5)
+        lines = dump("dump-step1b")
+        email = extract_email(lines, domain="gmail.com")
     for attempt in range(3):
         if email:
             break
-        log("email not found yet, retry %d" % (attempt + 1))
+        log("gmail.com email not found yet, retry %d" % (attempt + 1))
+        new_addr = find_lines(lines, "NEW ADDRESS")
+        if new_addr:
+            tap_line(new_addr[0])
         sleep(8)
         lines = dump("dump-step1-retry%d" % (attempt + 1))
-        email = extract_email(lines)
+        email = extract_email(lines, domain="gmail.com")
     if not email:
-        log("STOP: no temp email found on temp.tf")
+        log("STOP: no gmail.com temp email found on temp.tf")
         screencap("step4-blocked.png")
         return
     log("TEMP EMAIL: " + email)
     save_account(email)
 
-    # (c) muse.ai signup: enter the email, tap Continue
+    # (c) muse.ai signup: fixed-coordinate form interaction. The page is a
+    # WebView whose inner elements have no bounds in the dump, so dump-based
+    # taps cannot focus the field or press Continue. Coordinates are the field
+    # and button centres on a 1080x2340 screen, read from step2.png of run #2.
     open_url("https://muse.ai")
     sleep(15)
     screencap("step2.png")
     lines = dump("dump-step2")
-    field = find_lines(lines, "mobile number or email")
-    if not field:
-        field = find_lines(lines, "email")
-    edit = [ln for ln in field if "EditText" in ln]
-    target = edit[0] if edit else (field[0] if field else None)
-    if target is None:
-        log("STOP: could not find the email field on muse.ai")
-        screencap("step4-blocked.png")
-        return
-    tap_line(target)
+    tap(287, 1710)  # email field centre
     sleep(2)
     type_text(email)
     sleep(2)
-    cont = find_button(lines, "Continue")
-    if cont:
-        tap_line(cont[0])
-    else:
-        log("no Continue button found, pressing Enter")
-        adb_shell("input", "keyevent", "66")
-    sleep(8)
+    adb_shell("input", "keyevent", "66")  # Enter: submit the form
+    sleep(3)
     screencap("step3.png")
     lines = dump("dump-step3")
+    if still_on_form(lines):
+        log("still on the email form after Enter, hiding keyboard and tapping Continue")
+        adb_shell("input", "keyevent", "4")  # Back: hide the keyboard
+        sleep(2)
+        tap(120, 1955)  # Continue button centre
+        sleep(8)
+        screencap("step4-continue.png")
+        lines = dump("dump-step4")
     blob = NL.join(lines).lower()
 
-    # (d) what happened after Continue?
+    # (d) what happened after submitting?
     if any(w in blob for w in ("verify your phone", "phone verification",
                                "enter your phone", "sms code", "texted you")):
         log("STOP: phone verification requested")
@@ -447,7 +533,7 @@ def run_signup():
         lines = enter_code_on_muse(email, code)
         finish(lines, email)
         return
-    log("no verification screen detected after Continue, checking the result")
+    log("no verification screen detected after submitting, checking the result")
     finish(lines, email)
 
 
