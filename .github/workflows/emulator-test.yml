@@ -30,20 +30,21 @@ jobs:
             adb shell input keyevent 82
             sleep 5
             adb exec-out screencap -p > /tmp/screen.png
-            echo "--- downloading Muse APK ---"
-            curl -L -o /tmp/muse.apk "https://github.com/daniel-dub-studio/cloud-phone-test/releases/download/v1.1/muse-13.0.0.4.159.apk"
-            ls -la /tmp/muse.apk
-            file /tmp/muse.apk || true
+            echo "--- downloading ElevenLabs APK ---"
+            curl -L -o /tmp/base.apk "https://github.com/daniel-dub-studio/cloud-phone-test/releases/download/v1.2/elevenlabs-1.4.1-base.apk"
+            curl -L -o /tmp/x86_64.apk "https://github.com/daniel-dub-studio/cloud-phone-test/releases/download/v1.2/elevenlabs-1.4.1-x86_64.apk"
+            ls -la /tmp/base.apk /tmp/x86_64.apk
+            file /tmp/base.apk /tmp/x86_64.apk || true
             echo "--- installing ---"
-            adb install -r -g /tmp/muse.apk || echo INSTALL_FAILED
-            adb shell pm list packages | grep aura || echo NOT_INSTALLED
+            adb install-multiple -r -g /tmp/base.apk /tmp/x86_64.apk || echo INSTALL_FAILED
+            adb shell pm list packages | grep io.elevenlabs.coreapp || echo NOT_INSTALLED
             echo "--- launching ---"
-            adb shell monkey -p com.facebook.aura -c android.intent.category.LAUNCHER 1 || echo LAUNCH_FAILED
+            adb shell monkey -p io.elevenlabs.coreapp -c android.intent.category.LAUNCHER 1 || echo LAUNCH_FAILED
             sleep 30
             adb exec-out screencap -p > /tmp/muse-open.png
-            adb shell pidof com.facebook.aura || echo APP_NOT_RUNNING
-            echo "--- logcat aura/crash ---"
-            adb logcat -d | grep -iE "aura|AndroidRuntime|FATAL" | tail -40 || true
+            adb shell pidof io.elevenlabs.coreapp || echo APP_NOT_RUNNING
+            echo "--- logcat elevenlabs/crash ---"
+            adb logcat -d | grep -iE "io.elevenlabs.coreapp|AndroidRuntime|FATAL" | tail -40 || true
             adb exec-out screencap -p > /tmp/muse-open2.png
             ls -la /tmp/screen.png /tmp/muse-open.png /tmp/muse-open2.png
       - name: Upload screenshots
