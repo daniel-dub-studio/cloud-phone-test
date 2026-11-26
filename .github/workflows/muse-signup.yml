@@ -1,0 +1,51 @@
+name: muse-signup
+on:
+  workflow_dispatch:
+jobs:
+  signup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+      - name: Check KVM
+        run: |
+          ls -l /dev/kvm || echo "NO KVM DEVICE"
+          grep -c -E 'vmx|svm' /proc/cpuinfo || true
+          curl -s ifconfig.me; echo
+      - name: Enable KVM group perms
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+      - name: Boot emulator and run Muse signup
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          target: google_apis_playstore
+          arch: x86_64
+          profile: pixel_5
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+          script: |
+            adb shell getprop sys.boot_completed
+            adb shell input keyevent 82
+            sleep 5
+            adb exec-out screencap -p > /tmp/screen.png
+            pwd
+            ls -la scripts/
+            python3 scripts/muse-signup.py || true
+            ls -la /tmp/ || true
+      - name: Upload signup screenshots and dumps
+        uses: actions/upload-artifact@v4
+        with:
+          name: muse-signup
+          path: |
+            /tmp/screen.png
+            /tmp/step1.png
+            /tmp/step2.png
+            /tmp/step3.png
+            /tmp/muse-account.txt
+            /tmp/step4-*.png
+            /tmp/step5-*.png
+            /tmp/dump-*.xml
