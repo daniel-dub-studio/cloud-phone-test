@@ -1,0 +1,32 @@
+name: cloud-phone-test
+on:
+  workflow_dispatch:
+jobs:
+  emulator:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check KVM
+        run: |
+          ls -l /dev/kvm || echo "NO KVM DEVICE"
+          grep -c -E 'vmx|svm' /proc/cpuinfo || true
+          curl -s ifconfig.me; echo
+      - name: Boot emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          target: google_apis
+          arch: x86_64
+          profile: pixel_5
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+          script: |
+            adb shell getprop sys.boot_completed
+            adb shell input keyevent 82
+            sleep 5
+            adb exec-out screencap -p > /tmp/screen.png
+            ls -la /tmp/screen.png
+      - name: Upload screenshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: emulator-screen
+          path: /tmp/screen.png
