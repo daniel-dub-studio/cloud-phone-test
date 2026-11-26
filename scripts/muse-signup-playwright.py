@@ -22,9 +22,16 @@ Flow:
      input/change events), press Enter, and wait. If a name is asked for,
      enter "Muse". If the code is not accepted, keep polling for a new
      code until the deadline.
-  3. STOP (screenshot step4-verify.png, log the reason, do not proceed) if
+  3. After the code is accepted, the page asks "What's your birthday?"
+     with Month / Day / Year dropdowns and a Confirm button: set
+     Month=April, Day=12, Year=2005 (select_option by visible label),
+     then click Confirm. Then if a name is asked, enter "Muse".
+  4. STOP (screenshot step4-verify.png, log the reason, do not proceed) if
      a phone number, a payment card, a captcha/Turnstile, or a rejected
      email is asked for.
+
+Run #6 change: handle the birthday step run #5 reached (it stopped on an
+unrecognised screen, which was the birthday form).
 
 Outputs (all under /tmp, uploaded as the muse-signup-desktop artifact):
   muse-account.txt, step2-form.png, step3-after-continue.png,
@@ -166,9 +173,45 @@ def handle_name(page):
         return False
 
 
+def find_select(page, word):
+    """The <select> whose aria-label mentions word, or None."""
+    return locate_in_frames(
+        page,
+        lambda f: f.locator("select[aria-label*='%s' i]" % word))
+
+
+def handle_birthday(page):
+    """Fill the 'What's your birthday?' step: Month=April, Day=12,
+    Year=2005, then click Confirm. Uses select_option on the native
+    dropdowns (by visible label). Returns True when the birthday was set
+    and Confirm was clicked."""
+    month = find_select(page, "month")
+    day = find_select(page, "day")
+    year = find_select(page, "year")
+    if month is None or day is None or year is None:
+        all_sel = locate_in_frames(page, lambda f: f.locator("select"))
+        if all_sel is None or all_sel.count() < 3:
+            log("birthday dropdowns not found")
+            return False
+        log("birthday dropdowns found by order (Month, Day, Year)")
+        month, day, year = all_sel.nth(0), all_sel.nth(1), all_sel.nth(2)
+    try:
+        month.select_option(label="April", timeout=10000)
+        day.select_option(label="12", timeout=10000)
+        year.select_option(label="2005", timeout=10000)
+    except Exception as exc:
+        log("birthday select EXC: %r" % (exc,))
+        return False
+    log("birthday set to April 12, 2005")
+    if click_button(page, ("Confirm", "Continue", "Next")):
+        return True
+    log("Confirm button not found on the birthday step")
+    return False
+
+
 def classify(page):
     """Classify the current muse.ai screen. Returns one of: code, phone,
-    card, captcha, rejected, success, name, code-ok, other."""
+    card, captcha, rejected, birthday, success, name, code-ok, other."""
     low = body_text(page).lower()
     if any(w in low for w in PHONE_WORDS):
         return "phone"
@@ -178,6 +221,8 @@ def classify(page):
         return "captcha"
     if any(w in low for w in REJECTED_WORDS):
         return "rejected"
+    if "birthday" in low:
+        return "birthday"
     loc = locate_in_frames(
         page,
         lambda f: f.locator("input[aria-label*='security code' i], "
@@ -365,6 +410,13 @@ def run_signup(muse_page):
                 shot(muse_page, "step4-verify.png")
                 continue
             return "STOP: name step could not be completed"
+        if state == "birthday":
+            if handle_birthday(muse_page):
+                muse_page.wait_for_timeout(3000)
+                state, _ = wait_next_step(muse_page)
+                shot(muse_page, "step4-verify.png")
+                continue
+            return "STOP: birthday step could not be completed"
         if state == "code":
             if deadline is None:
                 deadline = time.time() + GIST_WAIT_SECONDS
