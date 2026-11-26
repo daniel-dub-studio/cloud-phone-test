@@ -47,6 +47,11 @@ code step after Enter), stop and report 'code rejected/expired' instead of
 looping and re-entering the same code from the gist (run #7 looped on the
 expired code, then failed to find the code field at all).
 
+Run #9 change: after the code is accepted, muse.ai may show a "Continue
+with your Meta Account" screen (an existing Meta Account is associated
+with the email). Daniel chose to create a new account, so the script
+clicks the "Create new account" link and continues to the birthday step.
+
 Outputs (all under /tmp, uploaded as the muse-signup-desktop artifact):
   muse-account.txt, step2-form.png, step3-after-continue.png,
   step4-verify.png
@@ -226,10 +231,37 @@ def handle_birthday(page):
     return False
 
 
+def handle_meta_new_account(page):
+    """On the 'Continue with your Meta Account' screen, click the
+    'Create new account' link (do not continue with the existing Meta
+    Account). Tries the link role in each frame first, then falls back
+    to a text match. Returns True when clicked."""
+    for frame in page.frames:
+        try:
+            link = frame.get_by_role("link", name="Create new account").first
+            if link.count():
+                link.click(timeout=10000)
+                log("clicked link 'Create new account'")
+                return True
+        except Exception:
+            continue
+    for frame in page.frames:
+        try:
+            text = frame.get_by_text("Create new account").first
+            if text.count():
+                text.click(timeout=10000)
+                log("clicked text 'Create new account'")
+                return True
+        except Exception:
+            continue
+    log("'Create new account' link not found")
+    return False
+
+
 def classify(page):
     """Classify the current muse.ai screen. Returns one of: code, phone,
-    card, captcha, rejected, exists, password, birthday, success, name,
-    code-ok, other."""
+    card, captcha, rejected, exists, password, meta, birthday, success,
+    name, code-ok, other."""
     low = body_text(page).lower()
     if any(w in low for w in PHONE_WORDS):
         return "phone"
@@ -250,6 +282,8 @@ def classify(page):
             pass
     if "welcome back" in low or "enter your password" in low:
         return "password"
+    if "continue with your meta account" in low:
+        return "meta"
     if "birthday" in low:
         return "birthday"
     loc = locate_in_frames(
@@ -440,6 +474,14 @@ def run_signup():
             if state == "password":
                 shot(page, "step4-verify.png")
                 return "STOP: password / sign-in asked for instead of a code"
+            if state == "meta":
+                if not handle_meta_new_account(page):
+                    shot(page, "step4-verify.png")
+                    return "STOP: Meta Account screen shown but 'Create new account' not clickable"
+                page.wait_for_timeout(4000)
+                state, _ = wait_next_step(page)
+                shot(page, "step4-verify.png")
+                continue
             if state == "success":
                 shot(page, "step4-verify.png")
                 return "ACCOUNT CREATED (apparent): success state reached"
