@@ -13,9 +13,12 @@ Flow:
      Screenshots step2-form.png (before) and step3-after-continue.png.
   3. Wait up to 60 s for the next step. If a verification code is asked
      for, fetch it from the temp.tf inbox (FETCH INBOX): check for up to
-     5 minutes, every ~15 s, accepting mail from any sender. If a code is
-     found, enter it; if a verification link is found instead, open it
-     in the muse.ai tab. If a name is asked for, enter "Muse".
+     5 minutes, every ~15 s, accepting mail from any sender, scanning
+     only actual message rows for a 6-digit code. If a code is found,
+     enter it without clicking the hidden field; if a verification link
+     is found instead, open it in the muse.ai tab. If a name is asked
+     for, enter "Muse". If no mail arrives after 5 minutes, generate a
+     fresh gmail.com address and resubmit once (max 2 addresses).
   4. STOP (screenshot step4-verify.png, log the reason, do not proceed) if
      a phone number, a payment card, a captcha/Turnstile, or a rejected
      temp email is asked for.
@@ -23,6 +26,11 @@ Flow:
 Run #2 change: the inbox wait is 5 minutes, every ~15 s (was 90 s), and
 mail from any sender is accepted -- run #1 only looked for "Muse", so a
 code from Meta or noreply would have been missed.
+
+Run #3 changes: the inbox scanner ignores the page chrome (run #2 matched
+the TOTAL RECEIVED counter as a code) and scans only message rows for a
+6-digit code; the code is entered without clicking the hidden sr-only
+input; a fresh address is tried once if no mail arrives after 5 minutes.
 
 Outputs (all under /tmp, uploaded as the muse-signup-desktop artifact):
   muse-account.txt, step1-temp.png, step2-form.png,
@@ -42,7 +50,6 @@ from playwright.sync_api import sync_playwright
 TMP = "/tmp"
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 CODE6_RE = re.compile(r"(?<![0-9])([0-9]{6})(?![0-9])")
-CODE_ANY_RE = re.compile(r"(?<![0-9])([0-9]{4,8})(?![0-9])")
 
 PHONE_WORDS = ("phone verification", "verify your phone", "enter your phone",
                "sms code", "texted you", "phone number")
@@ -85,12 +92,50 @@ def find_email(text, domain=None):
     return None
 
 
-def find_code(text):
-    for m in CODE6_RE.finditer(text):
-        return m.group(1)
-    for m in CODE_ANY_RE.finditer(text):
-        return m.group(1)
-    return None
+def strip_chrome(text):
+    """Remove temp.tf page-chrome counters so a site-wide number can never
+    pass as a verification code (run #2 matched "TOTAL RECEIVED 8064064")."""
+    text = re.sub(r"total received\s+[0-9,]+\s+messages", "", text, flags=re.I)
+    text = re.sub(r"total available.*?addresses", "", text, flags=re.I)
+    return text
+
+
+def find_code6(text):
+    """A 6-digit verification code only. The 4-8 digit fallback matched
+    the site's TOTAL RECEIVED counter in run #2, so it is not used."""
+    m = CODE6_RE.search(text)
+    return m.group(1) if m else None
+
+
+def inbox_rows_text(page):
+    """Text of actual inbox message rows only (no page chrome).
+
+    Returns (text, count): the joined subject/sender text of the message
+    rows found, and how many rows there were. Rows that only say the
+    inbox is empty are not counted.
+    """
+    for sel in ("tbody tr", "[class*='inbox-item' i]", "[class*='mail-item' i]",
+                "[class*='message-item' i]", "[class*='email-item' i]",
+                "[role='row']"):
+        try:
+            rows = page.locator(sel).all()
+        except Exception:
+            continue
+        texts = []
+        for row in rows:
+            try:
+                t = row.inner_text() or ""
+            except Exception:
+                continue
+            low = t.lower()
+            if not t.strip():
+                continue
+            if "no mail found" in low or "inbox is empty" in low:
+                continue
+            texts.append(t)
+        if texts:
+            return "\n".join(texts), len(texts)
+    return "", 0
 
 
 def locate_in_frames(page, make):
@@ -315,7 +360,7 @@ def wait_next_step(page, seconds=60):
 
 def find_link(page, text):
     """An absolute verification/confirm link: first from anchor hrefs,
-    then from any URL printed in the page text. None when there is none."""
+    then from any URL printed in the given text. None when there is none."""
     try:
         for a in page.locator("a").all():
             try:
@@ -353,16 +398,19 @@ def open_newest_message(page):
 def fetch_code(temp_page):
     """Fetch the Muse verification code (or link) from the temp.tf inbox.
 
-    Checks for up to 5 minutes, every ~15 s. Accepts mail from ANY sender:
-    the inbox text is scanned for a 6-digit code and for a verification
-    link, and the newest message is opened and scanned when the list text
-    holds neither. Returns (value, kind) where kind is "code", "link",
-    or None when nothing arrived.
+    Checks for up to 5 minutes, every ~15 s. Accepts mail from ANY sender.
+    Only actual message rows (subject/sender/body) are scanned for a
+    6-digit code -- the page chrome is never scanned, and an empty inbox
+    ("Inbox is empty" / "No mail found") is logged as empty and waited
+    out. Returns (value, kind) where kind is "code", "link", or None when
+    nothing arrived.
     """
     temp_page.bring_to_front()
     temp_page.wait_for_timeout(2000)
     deadline = time.time() + 300
+    check = 0
     while time.time() < deadline:
+        check += 1
         loc = temp_page.get_by_role("button", name="FETCH INBOX", exact=True).first
         try:
             if loc.count():
@@ -373,25 +421,34 @@ def fetch_code(temp_page):
             log("FETCH INBOX click EXC: %r" % (exc,))
         temp_page.wait_for_timeout(4000)
         text = body_text(temp_page)
-        squashed = " ".join(text.split())
-        log("inbox: " + squashed[:500])
-        code = find_code(text)
+        rows_text, n = inbox_rows_text(temp_page)
+        if n:
+            log("inbox check %d: %d message row(s) present" % (check, n))
+            scanned = strip_chrome(rows_text)
+        elif "inbox is empty" in text.lower() or "no mail found" in text.lower():
+            log("inbox check %d: empty, no mail for this address" % (check,))
+            temp_page.wait_for_timeout(11000)
+            continue
+        else:
+            log("inbox check %d: no message rows found, scanning cleaned page text" % check)
+            scanned = strip_chrome(text)
+        code = find_code6(scanned)
         if code:
             log("code found in the inbox list")
             return code, "code"
-        link = find_link(temp_page, text)
+        link = find_link(temp_page, scanned)
         if link:
             log("verification link found in the inbox list: " + link)
             return link, "link"
         # No code/link in the list text: open the newest message and scan it.
         if open_newest_message(temp_page):
             temp_page.wait_for_timeout(3000)
-            text = body_text(temp_page)
-            code = find_code(text)
+            opened = strip_chrome(body_text(temp_page))
+            code = find_code6(opened)
             if code:
                 log("code found in the opened message")
                 return code, "code"
-            link = find_link(temp_page, text)
+            link = find_link(temp_page, opened)
             if link:
                 log("verification link found in the opened message: " + link)
                 return link, "link"
@@ -402,7 +459,13 @@ def fetch_code(temp_page):
 
 
 def enter_code(page, code):
-    """Enter the verification code on muse.ai. Returns True on success."""
+    """Enter the verification code on muse.ai. Returns True on success.
+
+    The code field is a visually-hidden (sr-only) input covered by a div
+    that intercepts pointer events, so it is never clicked: fill it
+    directly, fall back to a force-fill, then to setting the value via
+    JavaScript, then to typing into the visible OTP boxes.
+    """
     loc = locate_in_frames(page, lambda f: f.get_by_label(re.compile("code", re.I)))
     if loc is None:
         loc = locate_in_frames(page, lambda f: f.locator("input[placeholder*='code' i]"))
@@ -411,13 +474,47 @@ def enter_code(page, code):
     if loc is None:
         log("code field not found")
         return False
-    try:
-        loc.first.click(timeout=10000)
-        loc.first.fill(code, timeout=10000)
-    except Exception as exc:
-        log("code fill EXC: %r" % (exc,))
+    field = loc.first
+    filled = False
+    for name, step in (("fill", 1), ("force-fill", 2), ("js-set", 3)):
+        try:
+            if step == 1:
+                field.fill(code, timeout=10000)
+            elif step == 2:
+                field.fill(code, timeout=10000, force=True)
+            else:
+                field.evaluate(
+                    "(el, v) => {"
+                    " const setter = Object.getOwnPropertyDescriptor("
+                    " window.HTMLInputElement.prototype, 'value').set;"
+                    " setter.call(el, v);"
+                    " el.dispatchEvent(new Event('input', {bubbles: true}));"
+                    " el.dispatchEvent(new Event('change', {bubbles: true}));"
+                    " }", code)
+        except Exception as exc:
+            log("code %s EXC: %r" % (name, exc))
+            continue
+        try:
+            if field.input_value(timeout=5000) == code:
+                filled = True
+                log("code field filled via %s" % name)
+                break
+        except Exception:
+            pass
+        log("code %s did not stick" % name)
+    if not filled:
+        # Last resort: click the visible OTP container and type the code.
+        try:
+            field.locator("xpath=ancestor::div[1]").click(timeout=5000)
+            page.keyboard.type(code, delay=80)
+            if field.input_value(timeout=5000) == code:
+                filled = True
+                log("code field filled by typing into the visible OTP boxes")
+        except Exception as exc:
+            log("code typing EXC: %r" % (exc,))
+    if not filled:
+        log("STOP: could not fill the code field")
         return False
-    log("code field filled")
     if not click_button(page, ["Verify", "Continue"]):
         try:
             page.keyboard.press("Enter")
@@ -446,83 +543,92 @@ def run_signup():
         ])
         context = browser.new_context(viewport={"width": 1280, "height": 900})
         temp_page = context.new_page()
+        page = context.new_page()
         try:
-            # (1) temp.tf: gmail.com address only
-            email = temp_email(temp_page)
-            shot(temp_page, "step1-temp.png")
-            if not email:
-                log("STOP: no gmail.com temp email found on temp.tf")
-                save_account(None, "no gmail.com temp email")
-                return
-            log("TEMP EMAIL: " + email)
-            save_account(email, "in progress")
+            # Up to 2 gmail.com addresses: if no mail arrives after the
+            # full 5-minute wait for the first one, generate a fresh
+            # address and resubmit the muse.ai form once.
+            for email_attempt in range(1, 3):
+                # (1) temp.tf: a gmail.com address (fresh on each attempt)
+                email = temp_email(temp_page)
+                shot(temp_page, "step1-temp.png")
+                if not email:
+                    log("STOP: no gmail.com temp email found on temp.tf")
+                    save_account(None, "no gmail.com temp email")
+                    return
+                log("TEMP EMAIL (attempt %d): %s" % (email_attempt, email))
+                save_account(email, "in progress")
 
-            # (2) muse.ai: fill the email form and submit
-            page = context.new_page()
-            page.goto("https://muse.ai", wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(5000)
-            log("muse.ai title: " + page.title() + " url: " + page.url)
-            shot(page, "step2-form.png")
-            if not fill_email(page, email):
-                log("STOP: could not fill the email field on muse.ai")
-                shot(page, "step4-verify.png")
-                save_account(email, "could not fill the email field")
-                return
-            if not click_button(page, ["Continue"]):
-                log("Continue click failed, pressing Enter instead")
-                try:
-                    page.keyboard.press("Enter")
-                except Exception:
-                    pass
-            page.wait_for_timeout(3000)
-            shot(page, "step3-after-continue.png")
+                # (2) muse.ai: fill the email form and submit
+                page.goto("https://muse.ai", wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(5000)
+                log("muse.ai title: " + page.title() + " url: " + page.url)
+                shot(page, "step2-form.png")
+                if not fill_email(page, email):
+                    log("STOP: could not fill the email field on muse.ai")
+                    shot(page, "step4-verify.png")
+                    save_account(email, "could not fill the email field")
+                    return
+                if not click_button(page, ["Continue"]):
+                    log("Continue click failed, pressing Enter instead")
+                    try:
+                        page.keyboard.press("Enter")
+                    except Exception:
+                        pass
+                page.wait_for_timeout(3000)
+                shot(page, "step3-after-continue.png")
 
-            # (3) what comes next? up to 3 rounds of code/name handling
-            for round_no in range(1, 4):
-                text = wait_next_step(page, seconds=60)
-                state = classify(text)
-                log("after Continue, round %d: state=%s" % (round_no, state))
-                if state in ("phone", "card", "captcha", "rejected"):
-                    log("STOP: " + state)
-                    outcome = state
-                    break
-                if state == "success":
-                    log("ACCOUNT CREATED (apparent)")
-                    outcome = "account created (apparent)"
-                    break
-                if state == "code":
-                    log("verification code requested, fetching it from the temp inbox")
-                    value, kind = fetch_code(temp_page)
-                    if kind is None:
-                        log("STOP: no verification code arrived")
-                        outcome = "verification code never arrived"
+                # (3) what comes next? up to 3 rounds of code/name handling
+                retry = False
+                for round_no in range(1, 4):
+                    text = wait_next_step(page, seconds=60)
+                    state = classify(text)
+                    log("after Continue, round %d: state=%s" % (round_no, state))
+                    if state in ("phone", "card", "captcha", "rejected"):
+                        log("STOP: " + state)
+                        outcome = state
                         break
-                    page.bring_to_front()
-                    page.wait_for_timeout(1000)
-                    if kind == "link":
-                        log("verification link found, opening it in the muse.ai tab")
-                        try:
-                            page.goto(value, wait_until="domcontentloaded", timeout=60000)
-                        except Exception as exc:
-                            log("verification link open EXC: %r" % (exc,))
+                    if state == "success":
+                        log("ACCOUNT CREATED (apparent)")
+                        outcome = "account created (apparent)"
+                        break
+                    if state == "code":
+                        log("verification code requested, fetching it from the temp inbox")
+                        value, kind = fetch_code(temp_page)
+                        if kind is None:
+                            log("no mail arrived after 5 minutes for %s" % email)
+                            outcome = "verification code never arrived"
+                            retry = (email_attempt == 1)
+                            break
+                        page.bring_to_front()
+                        page.wait_for_timeout(1000)
+                        if kind == "link":
+                            log("verification link found, opening it in the muse.ai tab")
+                            try:
+                                page.goto(value, wait_until="domcontentloaded", timeout=60000)
+                            except Exception as exc:
+                                log("verification link open EXC: %r" % (exc,))
+                            page.wait_for_timeout(5000)
+                            continue
+                        log("VERIFICATION CODE: " + value)
+                        if not enter_code(page, value):
+                            log("STOP: could not enter the verification code")
+                            outcome = "could not enter the verification code"
+                            break
                         page.wait_for_timeout(5000)
                         continue
-                    log("VERIFICATION CODE: " + value)
-                    if not enter_code(page, value):
-                        log("STOP: could not enter the verification code")
-                        outcome = "could not enter the verification code"
-                        break
-                    page.wait_for_timeout(5000)
-                    continue
-                if handle_name(page):
-                    click_button(page, ["Continue", "Create account"])
-                    page.wait_for_timeout(5000)
-                    continue
-                log("final state unclear")
-                outcome = "final state unclear"
-                break
-            else:
-                outcome = "final state unclear"
+                    if handle_name(page):
+                        click_button(page, ["Continue", "Create account"])
+                        page.wait_for_timeout(5000)
+                        continue
+                    log("final state unclear")
+                    outcome = "final state unclear"
+                    break
+                else:
+                    outcome = "final state unclear"
+                if not retry:
+                    break
+                log("trying a fresh gmail.com address (attempt 2 of 2)")
             shot(page, "step4-verify.png")
             save_account(email, outcome)
         finally:
