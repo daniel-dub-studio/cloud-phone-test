@@ -31,7 +31,7 @@ jobs:
             sleep 5
             adb exec-out screencap -p > /tmp/screen.png
             echo "--- downloading Muse APK ---"
-            curl -L -o /tmp/muse.apk "https://github.com/daniel-dub-studio/cloud-phone-test/releases/download/v1.0/muse-17.1.0.28.160.apk"
+            curl -L -o /tmp/muse.apk "https://github.com/daniel-dub-studio/cloud-phone-test/releases/download/v1.1/muse-13.0.0.4.159.apk"
             ls -la /tmp/muse.apk
             file /tmp/muse.apk || true
             echo "--- installing ---"
