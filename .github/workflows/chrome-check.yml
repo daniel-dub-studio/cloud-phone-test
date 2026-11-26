@@ -32,17 +32,22 @@ jobs:
             adb exec-out screencap -p > /tmp/screen.png
             adb shell am start -a android.intent.action.VIEW -d https://muse.ai
             sleep 12
-            adb shell input tap 540 2180
+            adb shell uiautomator dump /sdcard/window_dump.xml || true
+            adb pull /sdcard/window_dump.xml /tmp/dump.xml || true
+            grep -i "Accept" /tmp/dump.xml || true
+            L=$(grep -i "Accept" /tmp/dump.xml | grep -i "clickable=\"true\"" | head -1 || true); if [ -z "$L" ]; then L=$(grep -i "Accept" /tmp/dump.xml | head -1 || true); fi; B=$(echo "$L" | sed -n 's/.*bounds="\(\[[0-9]*,[0-9]*\]\[[0-9]*,[0-9]*\]\)".*/\1/p'); if [ -n "$B" ]; then C=$(echo "$B" | sed 's/\]\[/,/g; s/\[//g; s/\]//g'); X=$(echo "$C" | awk -F, '{print int(($1+$3)/2)}'); Y=$(echo "$C" | awk -F, '{print int(($2+$4)/2)}'); echo "TAP Accept -> ($X,$Y) bounds=$B"; adb shell input tap "$X" "$Y" || true; else echo "TAP Accept NOT FOUND"; fi
             sleep 5
+            adb exec-out screencap -p > /tmp/after-tap.png
             adb shell am start -a android.intent.action.VIEW -d https://muse.ai
             sleep 20
             adb exec-out screencap -p > /tmp/muse-ai.png
             adb shell dumpsys window windows | grep -i mCurrentFocus || true
-            ls -la /tmp/screen.png /tmp/muse-ai.png
+            ls -la /tmp/screen.png /tmp/after-tap.png /tmp/muse-ai.png
       - name: Upload screenshots
         uses: actions/upload-artifact@v4
         with:
           name: chrome-check
           path: |
             /tmp/screen.png
+            /tmp/after-tap.png
             /tmp/muse-ai.png
